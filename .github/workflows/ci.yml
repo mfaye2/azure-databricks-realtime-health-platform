@@ -11,7 +11,7 @@ on:
       - main
 
 jobs:
-  build:
+  build-and-validate:
     runs-on: ubuntu-22.04
 
     steps:
@@ -26,9 +26,132 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest requests
+          pip install pytest requests setuptools wheel nbformat
 
-      - name: Verify project files
+      - name: Check required project files
         run: |
-          echo "Checking Databricks project..."
-          ls -la
+          python - <<'PY'
+          import os
+          import sys
+
+          required_files = [
+              "01-config.ipynb",
+              "02-setup.ipynb",
+              "03-history-loader.ipynb",
+              "04-bronze.ipynb",
+              "05-silver.ipynb",
+              "06-gold.ipynb",
+              "07-run.ipynb",
+              "08-batch-test.ipynb",
+              "09-stream-test.ipynb",
+              "10-producer.ipynb",
+          ]
+
+          missing = [f for f in required_files if not os.path.exists(f)]
+
+          if missing:
+              print("Missing required files:")
+              for f in missing:
+                  print(f" - {f}")
+              sys.exit(1)
+
+          print("All required Databricks notebooks are present.")
+          PY
+
+      - name: Validate notebook JSON structure
+        run: |
+          python - <<'PY'
+          import glob
+          import nbformat
+          import sys
+
+          errors = []
+
+          for notebook in glob.glob("*.ipynb"):
+              try:
+                  nbformat.read(notebook, as_version=4)
+                  print(f"VALID: {notebook}")
+              except Exception as e:
+                  errors.append((notebook, str(e)))
+
+          if errors:
+              print("\nInvalid notebooks:")
+              for notebook, error in errors:
+                  print(f"{notebook}: {error}")
+              sys.exit(1)
+
+          print("\nAll notebooks have valid Jupyter structure.")
+          PY
+
+      - name: Check Python syntax inside notebooks
+        run: |
+          python - <<'PY'
+          import glob
+          import json
+          import ast
+          import sys
+
+          errors = []
+
+          for notebook in glob.glob("*.ipynb"):
+
+              with open(notebook, "r", encoding="utf-8") as f:
+                  nb = json.load(f)
+
+              for i, cell in enumerate(nb.get("cells", []), start=1):
+
+                  if cell.get("cell_type") != "code":
+                      continue
+
+                  source = "".join(cell.get("source", []))
+
+                  # Databricks/Jupyter magic commands are not standard Python
+                  lines = source.splitlines()
+
+                  filtered = []
+
+                  for line in lines:
+
+                      stripped = line.strip()
+
+                      if stripped.startswith("%"):
+                          continue
+
+                      filtered.append(line)
+
+                  code = "\n".join(filtered).strip()
+
+                  if not code:
+                      continue
+
+                  try:
+                      ast.parse(code)
+
+                  except SyntaxError as e:
+                      errors.append(
+                          f"{notebook} - cell {i}: {e}"
+                      )
+
+          if errors:
+              print("Python syntax errors found:")
+              for error in errors:
+                  print(error)
+
+              sys.exit(1)
+
+          print("No Python syntax errors detected.")
+          PY
+
+      - name: Create Databricks artifact
+        run: |
+          mkdir -p build
+
+          cp *.ipynb build/
+
+          zip -r databricks-build.zip build/
+
+      - name: Upload Databricks artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DatabricksBuild
+          path: databricks-build.zip
