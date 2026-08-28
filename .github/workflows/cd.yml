@@ -1,0 +1,126 @@
+name: CD - Deploy to Databricks
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-22.04
+
+    env:
+      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+      DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+
+    steps:
+      # 1 - Récupérer le code GitHub
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2 - Installer Python
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      # 3 - Installer Databricks CLI
+      - name: Install Databricks CLI
+        uses: databricks/setup-cli@main
+
+      # 4 - Vérifier la connexion à Databricks
+      - name: Test Databricks connection
+        run: |
+          databricks current-user me
+
+      # 5 - Créer le dossier cible et déployer les notebooks
+      - name: Deploy notebooks
+        run: |
+          databricks workspace mkdirs /Shared/github-cicd-deploy
+          databricks workspace import-dir . /Shared/github-cicd-deploy --overwrite
+
+      # 6 - Créer un Job Serverless temporaire
+      - name: Create integration test job
+        shell: bash
+        run: |
+          JOB_ID=$(databricks jobs create --json '{
+            "name": "github-cicd-batch-test",
+            "max_concurrent_runs": 1,
+            "tasks": [
+              {
+                "task_key": "batch_test",
+                "notebook_task": {
+                  "notebook_path": "/Shared/github-cicd-deploy/08-batch-test",
+                  "base_parameters": {
+                    "Environment": "dev"
+                  },
+                  "source": "WORKSPACE"
+                }
+              }
+            ]
+          }' | jq -r '.job_id')
+
+          echo "JOB_ID=$JOB_ID" >> "$GITHUB_ENV"
+
+          echo "Created Databricks Job: $JOB_ID"
+
+      # 7 - Lancer le Job
+      - name: Run integration test
+        shell: bash
+        run: |
+          RUN_ID=$(databricks jobs run-now "$JOB_ID" --no-wait \
+            | jq -r '.run_id')
+
+          echo "RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
+
+          echo "Started Databricks Run: $RUN_ID"
+
+      # 8 - Attendre la fin du Job
+      - name: Wait for integration test
+        shell: bash
+        run: |
+          STATUS="PENDING"
+
+          while [ "$STATUS" = "PENDING" ] || \
+                [ "$STATUS" = "RUNNING" ] || \
+                [ "$STATUS" = "QUEUED" ]; do
+
+            echo "Databricks run status: $STATUS"
+
+            sleep 20
+
+            STATUS=$(databricks jobs get-run "$RUN_ID" \
+              | jq -r '.state.life_cycle_state')
+
+          done
+
+          echo "Final lifecycle state: $STATUS"
+
+      # 9 - Vérifier le résultat
+      - name: Check integration test result
+        shell: bash
+        run: |
+          RESULT=$(databricks jobs get-run "$RUN_ID")
+
+          RESULT_STATE=$(echo "$RESULT" \
+            | jq -r '.state.result_state')
+
+          RESULT_MESSAGE=$(echo "$RESULT" \
+            | jq -r '.state.state_message')
+
+          echo "Result: $RESULT_STATE"
+          echo "Message: $RESULT_MESSAGE"
+
+          if [ "$RESULT_STATE" != "SUCCESS" ]; then
+            echo "Integration test failed."
+            exit 1
+          fi
+
+          echo "Integration test successful."
+
+      # 10 - Supprimer le Job temporaire
+      - name: Delete temporary Databricks job
+        if: always()
+        shell: bash
+        run: |
+          if [ -n "${JOB_ID:-}" ]; then
+            databricks jobs delete "$JOB_ID"
+          fi
